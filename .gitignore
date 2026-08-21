@@ -1,0 +1,11 @@
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Don't commit real memory contents when testing this template
+# (the vault-template/ folder is intentional — those are skeletons)
+# If you fork and want your own vault under version control, that's your call

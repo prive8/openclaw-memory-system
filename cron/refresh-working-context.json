@@ -1,0 +1,27 @@
+{
+  "name": "Refresh Working Context",
+  "description": "Refresh working-context.md if >24h stale. Runs 5 min before any other morning jobs so the agent has fresh state.",
+  "schedule": {
+    "kind": "cron",
+    "expr": "55 3 * * *",
+    "tz": "America/New_York"
+  },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "Run bash ~/.openclaw/workspace/scripts/refresh-working-context.sh and report exit code. If non-zero, read ~/.openclaw/logs/working-context-refresh.log and surface the error. Do nothing else.",
+    "lightContext": true
+  },
+  "delivery": {
+    "mode": "none"
+  },
+  "failureAlert": {
+    "after": 1,
+    "channel": "discord",
+    "to": "user:YOUR_DISCORD_USER_ID",
+    "cooldownMs": 3600000,
+    "mode": "announce",
+    "accountId": "default"
+  }
+}

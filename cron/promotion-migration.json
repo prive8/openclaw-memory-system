@@ -1,0 +1,28 @@
+{
+  "name": "Promotion Migration (MEMORY.md → memory-promotions.md)",
+  "description": "Run after Memory Dreaming Promotion cron to move auto-promoted snippets from MEMORY.md to memory-promotions.md. Dedup by memory-promotion markers.",
+  "schedule": {
+    "kind": "cron",
+    "expr": "30 3 * * *",
+    "tz": "America/New_York"
+  },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "Run bash ~/.openclaw/workspace/scripts/promotion-migrate.sh and report the output. If the script reports errors or fails, surface them.",
+    "lightContext": true
+  },
+  "delivery": {
+    "mode": "announce",
+    "channel": "discord",
+    "to": "user:YOUR_DISCORD_USER_ID",
+    "accountId": "default"
+  },
+  "failureAlert": {
+    "after": 1,
+    "channel": "discord",
+    "to": "user:YOUR_DISCORD_USER_ID",
+    "cooldownMs": 3600000
+  }
+}

@@ -1,0 +1,33 @@
+# Agent-OpenClaw Layer 1 Memory
+
+## Pointers
+- Vault: `<VAULT>`
+- Shared: `Agent-Shared/{project-state,decisions-log,user-profile}.md`
+- OpenClaw: `working-context.md`, `daily/YYYY-MM-DD.md`, `memory-promotions.md`, `mistakes.md`
+- Rules: `AGENTS.md`+`SOUL.md`
+- Scripts: `vault-preflight.sh`, `vault-write.sh`, `gh-api/`, `mail-send/`
+
+## 🔴 Security Boundary
+- _Add any work-context rules here, e.g., "never put work email in external AI"_
+- _Keep this section tight — one or two lines per rule._
+
+## Handles
+- _Social handles worth keeping (GitHub, X, Instagram, LinkedIn, etc.)_
+
+## Repos
+- _Your active repos and any auth notes (e.g., PAT rotation dates)_
+
+## Local AI
+- _Ollama endpoint, embedding model, memory config_
+
+## Memory & Rules
+- Four layers: built-in L1 · `AGENTS.md`/`SOUL.md` · Obsidian vault · session search
+- L1 = pointers + tiny always-present facts only. Regular memory lives in `MEMORY.md` and vault files.
+- Session-start reads `MEMORY.md` for regular memory (no L1 sync; L1 is hand-curated and stable)
+- Working-context auto-refreshed at 03:55 local if >24h stale; AGENTS.md fails if >24h or daily-log gap >2d
+- Gateway config changes need full restart
+
+<!--
+Hard rule: keep this file under 2200 characters. Curated by hand.
+Don't mirror MEMORY.md or vault contents here. Pointers + tiny facts only.
+-->

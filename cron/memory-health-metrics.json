@@ -1,0 +1,25 @@
+{
+  "name": "Memory Health Metrics",
+  "description": "Runs memory-health.sh to compute metrics and write to HEARTBEAT.md. LLM wraps the bash via isolated agentTurn; the agent decides whether to alert on bad state based on script output.",
+  "schedule": {
+    "kind": "cron",
+    "expr": "5 4 * * *",
+    "tz": "America/New_York"
+  },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "Run bash ~/.openclaw/workspace/scripts/memory-health.sh and report the output. If the script reports errors or fails, surface them.",
+    "lightContext": true
+  },
+  "delivery": {
+    "mode": "none"
+  },
+  "failureAlert": {
+    "after": 1,
+    "channel": "discord",
+    "to": "user:YOUR_DISCORD_USER_ID",
+    "cooldownMs": 3600000
+  }
+}

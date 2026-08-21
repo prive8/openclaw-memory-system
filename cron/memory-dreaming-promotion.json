@@ -1,0 +1,19 @@
+{
+  "name": "Memory Dreaming Promotion",
+  "description": "Promote weighted short-term recall snippets into MEMORY.md. Managed by the memory-core plugin; do not edit the message string. Tune thresholds under plugins.entries.memory-core.config.dreaming.",
+  "schedule": {
+    "kind": "cron",
+    "expr": "0 3 * * *",
+    "tz": "America/New_York"
+  },
+  "sessionTarget": "isolated",
+  "wakeMode": "now",
+  "payload": {
+    "kind": "agentTurn",
+    "message": "__openclaw_memory_core_short_term_promotion_dream__",
+    "lightContext": true
+  },
+  "delivery": {
+    "mode": "none"
+  }
+}
