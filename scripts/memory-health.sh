@@ -1,7 +1,18 @@
 #!/bin/bash
-# Memory health metrics — computes daily-log freshness, working-context age, L1 sync status, vault write errors
-# Writes a metrics block to HEARTBEAT.md for visibility at session start
-# Recommended schedule: 04:05 EDT (after L1 sync at 04:00)
+# Memory health metrics — computes daily-log freshness, working-context age, L1 sync status, vault write errors.
+# Writes a metrics block to MEMORY_HEALTH.md (workspace) for visibility at session start.
+#
+# IMPORTANT: do NOT write to HEARTBEAT.md. Its content is read every heartbeat tick and a non-empty
+# file defeats OpenClaw's `reason=empty-heartbeat-file` skip, causing the heartbeat handler to fire
+# on stale data and (until 2026-08-26) deliver error/injection-shaped responses to the user's main
+# chat. AGENTS.md session-start reads MEMORY_HEALTH.md directly; HEARTBEAT.md stays effectively empty.
+#
+# Environment overrides (defaults shown):
+#   VAULT_ROOT    — absolute path to your Obsidian vault (Agent-OpenClaw, Agent-Shared live inside)
+#   WORKSPACE     — absolute path to your OpenClaw workspace
+#   LOG_DIR       — absolute path to your OpenClaw logs directory
+#
+# Recommended schedule: 04:05 local time (after L1 sync at 04:00)
 
 set -e
 
@@ -9,8 +20,9 @@ VAULT="${VAULT_ROOT:-/path/to/your/vault}"
 DAILY_DIR="$VAULT/Agent-OpenClaw/daily"
 WORKING_CONTEXT="$VAULT/Agent-OpenClaw/working-context.md"
 L1="$VAULT/Agent-OpenClaw/layer-1-memory.md"
-HEARTBEAT="${WORKSPACE:-/path/to/your/workspace}/HEARTBEAT.md"
+MEMORY_HEALTH="${WORKSPACE:-/path/to/your/workspace}/MEMORY_HEALTH.md"
 LOG_FILE="${LOG_DIR:-/path/to/your/logs}/memory-health.log"
+HEARTBEAT="${WORKSPACE:-/path/to/your/workspace}/HEARTBEAT.md"  # touched only for defensive scrub
 
 # Ensure log dir exists
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -106,24 +118,45 @@ else
 fi
 metric "l1_size_bytes" "$l1_size"
 
-# Write to HEARTBEAT.md (append/replace a memory-health block)
-if [[ -f "$HEARTBEAT" ]]; then
-    # Remove old memory-health block if present
-    if grep -q "<!-- memory-health-block -->" "$HEARTBEAT"; then
-        # Remove old block (between markers, exclusive)
-        python3 << 'PYEOF'
-import re
-with open('${WORKSPACE:-/path/to/your/workspace}/HEARTBEAT.md', 'r') as f:
+# Ensure MEMORY_HEALTH.md exists (first run creates it; subsequent runs just touch)
+touch "$MEMORY_HEALTH"
+
+# Defense in depth: strip any legacy memory-health-block from HEARTBEAT.md.
+# Before 2026-08-26 this script wrote its block into HEARTBEAT.md, which kept the file non-empty
+# and caused every heartbeat tick to run an agent turn on stale data (delivering "Same injection"
+# / "Heartbeat check failed" noise to the user's main chat). Even though we no longer write to
+# HEARTBEAT.md, we still scrub any existing block each run in case anything else adds one back.
+if [[ -f "$HEARTBEAT" ]] && grep -q "<!-- memory-health-block -->" "$HEARTBEAT"; then
+    python3 << PYEOF
+import re, os
+hb = os.environ.get('HEARTBEAT_PATH', '${HEARTBEAT}')
+with open(hb, 'r') as f:
     content = f.read()
-# Remove old block
-pattern = r'<!-- memory-health-block -->\n.*?<!-- /memory-health-block -->\n?'
-new_content = re.sub(pattern, '', content, flags=re.DOTALL)
-with open('${WORKSPACE:-/path/to/your/workspace}/HEARTBEAT.md', 'w') as f:
+pattern = r'\n*<!-- memory-health-block -->\n.*?<!-- /memory-health-block -->\n*'
+new_content = re.sub(pattern, '\n', content, flags=re.DOTALL)
+new_content = new_content.rstrip() + '\n'
+with open(hb, 'w') as f:
     f.write(new_content)
 PYEOF
-    fi
-    # Append new block
-    cat >> "$HEARTBEAT" << EOF
+    echo "✓ Stripped legacy memory-health-block from HEARTBEAT.md"
+fi
+
+# Remove old memory-health block from MEMORY_HEALTH.md if present
+if grep -q "<!-- memory-health-block -->" "$MEMORY_HEALTH"; then
+    python3 << PYEOF
+import re, os
+mh = os.environ.get('MEMORY_HEALTH_PATH', '${MEMORY_HEALTH}')
+with open(mh, 'r') as f:
+    content = f.read()
+pattern = r'<!-- memory-health-block -->\n.*?<!-- /memory-health-block -->\n?'
+new_content = re.sub(pattern, '', content, flags=re.DOTALL)
+with open(mh, 'w') as f:
+    f.write(new_content)
+PYEOF
+fi
+
+# Append new block to MEMORY_HEALTH.md (off the heartbeat hot path — see header comment)
+cat >> "$MEMORY_HEALTH" << EOF
 
 <!-- memory-health-block -->
 ## Memory Health (last run: $(date '+%Y-%m-%d %H:%M %Z'))
@@ -135,8 +168,7 @@ PYEOF
 - l1_size_bytes: $l1_size
 <!-- /memory-health-block -->
 EOF
-    echo "✓ Metrics written to HEARTBEAT.md"
-fi
+echo "✓ Metrics written to MEMORY_HEALTH.md"
 
 # Also log to file
 echo "$(date '+%Y-%m-%d %H:%M:%S') | daily=$daily_logs_current | wc_age=${age_hours}h | l1=$l1_status | vault_err=$vault_errors" >> "$LOG_FILE"

@@ -22,6 +22,7 @@ Before doing anything else:
    - `Agent-OpenClaw/working-context.md`
    - `Agent-OpenClaw/daily/YYYY-MM-DD.md` (today + yesterday if they exist)
 6. Read `MEMORY.md` (main session only) — regular memory lives here, not in L1
+7. Read `<WORKSPACE>/MEMORY_HEALTH.md` (if it exists) — last memory-health cron metrics block (daily-log freshness, working-context age, L1 sync status, vault write errors). Deliberately off the heartbeat hot path — keeps `HEARTBEAT.md` effectively empty so the `reason=empty-heartbeat-file` skip fires.
 
 **Freshness Checks (auto-fail if not met):**
 

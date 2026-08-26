@@ -105,6 +105,14 @@ When L1 needs to change (rare):
 
 - Open the file. Edit by hand. Commit if version-controlled. Done.
 
+## What goes where (and what stays off the heartbeat hot path)
+
+OpenClaw's heartbeat handler reads `HEARTBEAT.md` every tick. The handler skips the model call entirely when the file is effectively empty (only blank lines, Markdown/HTML comments, headings, fence markers, or empty checklist stubs) — `reason=empty-heartbeat-file`. Populated content forces a model call on every tick, which (a) burns tokens on stale data and (b) can produce misfires the runtime delivers to the user's main chat.
+
+**Rule:** any cron-driven script that wants to surface metrics at session start writes to `MEMORY_HEALTH.md` (workspace). `AGENTS.md` session-start reads it. `HEARTBEAT.md` is reserved for stable, human-curated checklists the heartbeat handler should actually consider — never for cron-generated data.
+
+If a legacy block ever leaks into `HEARTBEAT.md` from another tool, `memory-health.sh` strips it on its next run as defense in depth.
+
 ## What this isn't
 
 This isn't a fancy retrieval-augmented generation (RAG) system. There's no vector database on the hot path, no embedding pipeline, no chunker. The hot path is "read these specific files in this order." L4 search is opt-in via the `memory_search` tool, gated by relevance.
