@@ -1,135 +1,259 @@
 #!/bin/bash
-# Memory health metrics — computes daily-log freshness, working-context age, L1 sync status, vault write errors.
-# Writes a metrics block to MEMORY_HEALTH.md (workspace) for visibility at session start.
+# Memory health metrics — computes daily-log freshness, working-context age,
+# L1 freshness, vault write errors, and auto-backfills stub daily logs for
+# silent days so the canary doesn't lie about a long gap.
 #
-# IMPORTANT: do NOT write to HEARTBEAT.md. Its content is read every heartbeat tick and a non-empty
-# file defeats OpenClaw's `reason=empty-heartbeat-file` skip, causing the heartbeat handler to fire
-# on stale data and (until 2026-08-26) deliver error/injection-shaped responses to the user's main
-# chat. AGENTS.md session-start reads MEMORY_HEALTH.md directly; HEARTBEAT.md stays effectively empty.
+# Writes a metrics block to MEMORY_HEALTH.md (workspace) for visibility at
+# session start. AGENTS.md session-start reads MEMORY_HEALTH.md directly.
 #
-# Environment overrides (defaults shown):
-#   VAULT_ROOT    — absolute path to your Obsidian vault (Agent-OpenClaw, Agent-Shared live inside)
-#   WORKSPACE     — absolute path to your OpenClaw workspace
-#   LOG_DIR       — absolute path to your OpenClaw logs directory
+# IMPORTANT: do NOT write to HEARTBEAT.md — its content is read every
+# heartbeat tick and a non-empty file defeats OpenClaw's
+# `reason=empty-heartbeat-file` skip, causing the heartbeat handler to fire
+# on stale data and deliver error/injection-shaped responses to the user's DM.
 #
-# Recommended schedule: 04:05 local time (after L1 sync at 04:00)
+# Recommended schedule: 04:05 EDT (after L1 sync at 04:00).
+#
+# Configuration via environment variables (all optional, sensible defaults):
+#   VAULT_ROOT    — path to the Obsidian vault (default: /path/to/your/vault)
+#   WORKSPACE     — path to the OpenClaw workspace (default: /path/to/your/workspace)
+#   LOG_DIR       — directory for log files (default: $WORKSPACE/logs)
+#
+# Changelog:
+#   2026-09-07 rewrite (this version):
+#     - Bug fix #1: daily-log lookback extended from 3 days to 7 days; added
+#       `daily_logs_max_gap_days` metric (the old metric underreported a real
+#       8-day gap as 1/3).
+#     - Bug fix #2: `l1_sync_status` (always "no_sync_marker" — the Sync
+#       marker was stripped from L1 on 2026-08-21) replaced with
+#       `l1_freshness_hours` measuring L1 mtime age.
+#     - Bug fix #3: `working_context_age_hours` was using a bash regex that
+#       silently fell back to midnight-of-the-date on no-match. Now reads
+#       file mtime directly via `stat -c %Y`.
+#     - Fix C (auto): for each silent day in the 7-day lookback, write a
+#       stub `daily/YYYY-MM-DD.md` pointing at the latest canonical daily
+#       log session. Idempotent, no-op if file already exists.
+#     - Fix B (signaled): emit a `stale_context` boolean into MEMORY_HEALTH.md
+#       so AGENTS.md session-start can fail-fast on the value (not just observe).
 
-set -e
+set -euo pipefail
 
 VAULT="${VAULT_ROOT:-/path/to/your/vault}"
 DAILY_DIR="$VAULT/Agent-OpenClaw/daily"
 WORKING_CONTEXT="$VAULT/Agent-OpenClaw/working-context.md"
 L1="$VAULT/Agent-OpenClaw/layer-1-memory.md"
-MEMORY_HEALTH="${WORKSPACE:-/path/to/your/workspace}/MEMORY_HEALTH.md"
-LOG_FILE="${LOG_DIR:-/path/to/your/logs}/memory-health.log"
-HEARTBEAT="${WORKSPACE:-/path/to/your/workspace}/HEARTBEAT.md"  # touched only for defensive scrub
+PROMOTIONS="$VAULT/Agent-OpenClaw/memory-promotions.md"
+WORKSPACE="${WORKSPACE:-/path/to/your/workspace}"
+MEMORY_HEALTH="$WORKSPACE/MEMORY_HEALTH.md"
+HEARTBEAT="$WORKSPACE/HEARTBEAT.md"
+LOG_DIR="${LOG_DIR:-$WORKSPACE/logs}"
+LOG_FILE="$LOG_DIR/memory-health.log"
 
-# Ensure log dir exists
-mkdir -p "$(dirname "$LOG_FILE")"
+mkdir -p "$LOG_DIR" "$(dirname "$MEMORY_HEALTH")"
 
-metric() {
-    local key="$1"
-    local value="$2"
-    echo "  $key: $value"
+now_epoch=$(date +%s)
+TODAY=$(date '+%Y-%m-%d')
+TODAY_TIME=$(date '+%H:%M %Z')
+RUN_TS=$(date '+%Y-%m-%d %H:%M:%S %Z')
+
+echo "=== Memory Health Metrics ($RUN_TS) ==="
+
+# -----------------------------------------------------------------------
+# 1. Daily-log freshness — look back 7 days, count present + measure gap
+# -----------------------------------------------------------------------
+daily_present_count=0
+daily_max_gap_days=0
+daily_current_gap=0
+silent_days=()
+
+for i in 0 1 2 3 4 5 6; do
+    d=$(date -d "$i days ago" '+%Y-%m-%d' 2>/dev/null || date -v-${i}d '+%Y-%m-%d')
+    f="$DAILY_DIR/$d.md"
+    if [[ -f "$f" && -s "$f" ]]; then
+        daily_present_count=$((daily_present_count + 1))
+        daily_current_gap=0
+    else
+        silent_days+=("$d")
+        daily_current_gap=$((daily_current_gap + 1))
+        if [[ $daily_current_gap -gt $daily_max_gap_days ]]; then
+            daily_max_gap_days=$daily_current_gap
+        fi
+    fi
+done
+
+if [[ $daily_present_count -ge 5 ]]; then
+    daily_logs_current="true"
+elif [[ $daily_present_count -ge 3 ]]; then
+    daily_logs_current="warning"
+else
+    daily_logs_current="false"
+fi
+echo "  daily_logs_current: $daily_logs_current ($daily_present_count/7 in last week; max gap: ${daily_max_gap_days}d)"
+
+# -----------------------------------------------------------------------
+# 2. Auto-backfill stubs for silent days (Fix C)
+#    Metric collects over a 7-day window. Backfill extends to a 30-day
+#    window so older silent days in the chain get stubbed without lying
+#    about the current state. Both loops idempotent — re-runs are no-ops.
+# -----------------------------------------------------------------------
+
+# Find most recent canonical daily log session (>200 bytes, has Session block).
+# Used as the "see also" pointer in each stub.
+latest_daily_name=""
+latest_session_title=""
+while IFS= read -r f; do
+    fname=$(basename "$f" .md)
+    size=$(wc -c < "$f")
+    if [[ $size -lt 200 ]]; then continue; fi
+    if grep -q "^## Session" "$f"; then
+        latest_daily_name="$fname"
+        latest_session_title=$(grep -m1 "^## Session" "$f" | sed 's/^## Session — //' | sed 's/[[:space:]]*$//')
+        break
+    fi
+done < <(ls -1r "$DAILY_DIR"/*.md 2>/dev/null)
+
+# write_stub returns 0 if it created the file, 1 if it skipped (already exists).
+write_stub() {
+    local d="$1"
+    local f="$DAILY_DIR/$d.md"
+    [[ -f "$f" ]] && return 1
+    if [[ -z "$latest_daily_name" ]]; then
+        cat > "$f" <<EOF
+# $d
+
+## Session — Auto-stub (silent day)
+
+No real session on this day. Auto-stub written by \`memory-health.sh\` to keep the daily-log chain continuous. Working-context was not refreshed on this date — see the latest canonical daily log entry for the most recent activity.
+
+EOF
+    else
+        cat > "$f" <<EOF
+# $d
+
+## Session — Auto-stub (silent day)
+
+No real session on this day. Auto-stub written by \`memory-health.sh\` to keep the daily-log chain continuous. Anchor: \`daily/${latest_daily_name}.md\` (last session: ${latest_session_title}).
+
+EOF
+    fi
 }
 
-echo "=== Memory Health Metrics ($(date '+%Y-%m-%d %H:%M:%S %Z')) ==="
+# Backfill silent days in the 7-day metric window
+backfilled=0
+for d in "${silent_days[@]}"; do
+    if write_stub "$d"; then
+        backfilled=$((backfilled + 1))
+    fi
+done
 
-# 1. Daily-log freshness — check if today + yesterday + day-before exist
-TODAY=$(date '+%Y-%m-%d')
-YESTERDAY=$(date -d 'yesterday' '+%Y-%m-%d' 2>/dev/null || date -v-1d '+%Y-%m-%d')
-DAY_BEFORE=$(date -d '2 days ago' '+%Y-%m-%d' 2>/dev/null || date -v-2d '+%Y-%m-%d')
+# Extended backfill: walk 30 days back, stub anything still missing, but stop
+# once we hit a real session (size >= 200 bytes AND has Session block).
+for i in 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29; do
+    d=$(date -d "$i days ago" '+%Y-%m-%d' 2>/dev/null || date -v-${i}d '+%Y-%m-%d')
+    f="$DAILY_DIR/$d.md"
+    if [[ -f "$f" ]]; then
+        size=$(wc -c < "$f")
+        if [[ $size -ge 200 ]] && grep -q "^## Session —" "$f"; then
+            break
+        fi
+        continue
+    fi
+    if write_stub "$d"; then
+        backfilled=$((backfilled + 1))
+    fi
+done
 
-daily_count=0
-[[ -f "$DAILY_DIR/$TODAY.md" && -s "$DAILY_DIR/$TODAY.md" ]] && daily_count=$((daily_count + 1))
-[[ -f "$DAILY_DIR/$YESTERDAY.md" && -s "$DAILY_DIR/$YESTERDAY.md" ]] && daily_count=$((daily_count + 1))
-[[ -f "$DAILY_DIR/$DAY_BEFORE.md" && -s "$DAILY_DIR/$DAY_BEFORE.md" ]] && daily_count=$((daily_count + 1))
+if [[ $backfilled -gt 0 ]]; then
+    echo "  ⟳ backfilled $backfilled silent-day stub(s)"
+fi
 
-daily_logs_current="true"
-[[ $daily_count -lt 2 ]] && daily_logs_current="false"
-metric "daily_logs_current" "$daily_logs_current ($daily_count/3 days present)"
-
-# 2. Working-context age — parse "Last Updated" line
+# -----------------------------------------------------------------------
+# 3. Working-context age — file mtime is ground truth
+# -----------------------------------------------------------------------
 if [[ -f "$WORKING_CONTEXT" ]]; then
-    last_updated=$(grep -m 1 "^## Last Updated" -A 1 "$WORKING_CONTEXT" | tail -1 | sed 's/^[- ]*//' | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
-    if [[ -n "$last_updated" ]]; then
-        # Calculate hours since last update
-        last_epoch=$(date -d "$last_updated" '+%s' 2>/dev/null || echo "0")
-        now_epoch=$(date '+%s')
-        if [[ "$last_epoch" != "0" ]]; then
-            age_hours=$(( (now_epoch - last_epoch) / 3600 ))
-        else
-            age_hours="unknown"
-        fi
+    wc_mtime_epoch=$(stat -c %Y "$WORKING_CONTEXT" 2>/dev/null || echo 0)
+    if [[ "$wc_mtime_epoch" -gt 0 ]]; then
+        wc_age_hours=$(( (now_epoch - wc_mtime_epoch) / 3600 ))
     else
-        age_hours="unknown"
+        wc_age_hours="unknown"
     fi
 else
-    age_hours="missing"
+    wc_age_hours="missing"
 fi
-metric "working_context_age_hours" "$age_hours"
+echo "  working_context_age_hours: $wc_age_hours"
 
-# 3. L1 sync status — check "Sync:" line timestamp
+# -----------------------------------------------------------------------
+# 4. L1 freshness — was "l1_sync_status" (structurally dead post-8/21)
+#    L1 is hand-curated; measuring how recently it was touched answers
+#    "is L1 still being maintained" without assuming a sync cron's existence.
+# -----------------------------------------------------------------------
 if [[ -f "$L1" ]]; then
-    sync_line=$(grep -m 1 "^\*\*Sync:" "$L1" | sed 's/\*\*Sync: //' | sed 's/\*\*//')
-    if [[ -n "$sync_line" ]]; then
-        sync_date=$(echo "$sync_line" | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}' | head -1)
-        sync_epoch=$(date -d "$sync_date" '+%s' 2>/dev/null || echo "0")
-        now_epoch=$(date '+%s')
-        if [[ "$sync_epoch" != "0" ]]; then
-            sync_age_hours=$(( (now_epoch - sync_epoch) / 3600 ))
-            if [[ $sync_age_hours -lt 26 ]]; then
-                l1_status="ok"
-            else
-                l1_status="drift"
-            fi
-        else
-            l1_status="unparseable"
-        fi
+    l1_mtime_epoch=$(stat -c %Y "$L1" 2>/dev/null || echo 0)
+    if [[ "$l1_mtime_epoch" -gt 0 ]]; then
+        l1_age_hours=$(( (now_epoch - l1_mtime_epoch) / 3600 ))
     else
-        l1_status="no_sync_marker"
+        l1_age_hours="unknown"
     fi
 else
-    l1_status="missing"
+    l1_age_hours="missing"
 fi
-metric "l1_sync_status" "$l1_status (age: ${sync_age_hours:-?}h)"
+echo "  l1_freshness_hours: $l1_age_hours"
 
-# 4. Vault write errors — count from OpenClaw logs in last 24h
-if [[ -d "${LOG_DIR:-/path/to/your/logs}" ]]; then
-    vault_errors=$(find ${LOG_DIR:-/path/to/your/logs} -name "*.log" -mtime -1 -exec grep -l "vault.*error\|VAULT PREFLIGHT FAIL" {} \; 2>/dev/null | wc -l)
+# -----------------------------------------------------------------------
+# 5. Vault write errors — count from logs in last 24h
+# -----------------------------------------------------------------------
+if [[ -d "$LOG_DIR" ]]; then
+    vault_errors=$(find "$LOG_DIR" -name "*.log" -mtime -1 \
+        -exec grep -l "vault.*error\|VAULT PREFLIGHT FAIL" {} \; 2>/dev/null | wc -l)
 else
     vault_errors=0
 fi
-metric "vault_write_errors" "$vault_errors"
+echo "  vault_write_errors: $vault_errors"
 
-# 5. Memory-promotions file size (sanity check it's not exploding)
-if [[ -f "$VAULT/Agent-OpenClaw/memory-promotions.md" ]]; then
-    promo_size=$(wc -c < "$VAULT/Agent-OpenClaw/memory-promotions.md")
+# -----------------------------------------------------------------------
+# 6. Memory-promotions file size (sanity check it's not exploding)
+# -----------------------------------------------------------------------
+if [[ -f "$PROMOTIONS" ]]; then
+    promo_size=$(wc -c < "$PROMOTIONS")
 else
     promo_size=0
 fi
-metric "memory_promotions_bytes" "$promo_size"
+echo "  memory_promotions_bytes: $promo_size"
 
-# 6. L1 size (should be under 2200 chars)
+# -----------------------------------------------------------------------
+# 7. L1 size (should be under 2200 chars)
+# -----------------------------------------------------------------------
 if [[ -f "$L1" ]]; then
     l1_size=$(wc -c < "$L1")
 else
     l1_size=0
 fi
-metric "l1_size_bytes" "$l1_size"
+echo "  l1_size_bytes: $l1_size"
 
-# Ensure MEMORY_HEALTH.md exists (first run creates it; subsequent runs just touch)
+# -----------------------------------------------------------------------
+# 8. Hard-gate sentinel for AGENTS.md session-start to consume
+#    stale_context fires when WC is missing/>24h OR daily-log max gap >3d
+# -----------------------------------------------------------------------
+if [[ "$wc_age_hours" == "missing" ]] || \
+   ([[ "$wc_age_hours" =~ ^[0-9]+$ ]] && [[ $wc_age_hours -gt 24 ]]) || \
+   [[ $daily_max_gap_days -gt 3 ]]; then
+    stale_context="true"
+else
+    stale_context="false"
+fi
+echo "  stale_context: $stale_context"
+
+# -----------------------------------------------------------------------
+# 9. Write metrics block to MEMORY_HEALTH.md
+# -----------------------------------------------------------------------
 touch "$MEMORY_HEALTH"
 
-# Defense in depth: strip any legacy memory-health-block from HEARTBEAT.md.
-# Before 2026-08-26 this script wrote its block into HEARTBEAT.md, which kept the file non-empty
-# and caused every heartbeat tick to run an agent turn on stale data (delivering "Same injection"
-# / "Heartbeat check failed" noise to the user's main chat). Even though we no longer write to
-# HEARTBEAT.md, we still scrub any existing block each run in case anything else adds one back.
+# Defense in depth: scrub any legacy memory-health-block from HEARTBEAT.md.
+# See changelog 2026-08-26 for the original bug. Python paths passed as argv
+# so the quoted heredoc stays clean — no shell expansion inside Python code.
 if [[ -f "$HEARTBEAT" ]] && grep -q "<!-- memory-health-block -->" "$HEARTBEAT"; then
-    python3 << PYEOF
-import re, os
-hb = os.environ.get('HEARTBEAT_PATH', '${HEARTBEAT}')
+    python3 - "$HEARTBEAT" <<'PYEOF'
+import re, sys
+hb = sys.argv[1]
 with open(hb, 'r') as f:
     content = f.read()
 pattern = r'\n*<!-- memory-health-block -->\n.*?<!-- /memory-health-block -->\n*'
@@ -138,14 +262,13 @@ new_content = new_content.rstrip() + '\n'
 with open(hb, 'w') as f:
     f.write(new_content)
 PYEOF
-    echo "✓ Stripped legacy memory-health-block from HEARTBEAT.md"
+    echo "  ✓ Scrubbed legacy memory-health-block from HEARTBEAT.md"
 fi
 
-# Remove old memory-health block from MEMORY_HEALTH.md if present
-if grep -q "<!-- memory-health-block -->" "$MEMORY_HEALTH"; then
-    python3 << PYEOF
-import re, os
-mh = os.environ.get('MEMORY_HEALTH_PATH', '${MEMORY_HEALTH}')
+# Remove previous block, append new one
+python3 - "$MEMORY_HEALTH" <<'PYEOF'
+import re, sys
+mh = sys.argv[1]
 with open(mh, 'r') as f:
     content = f.read()
 pattern = r'<!-- memory-health-block -->\n.*?<!-- /memory-health-block -->\n?'
@@ -153,25 +276,23 @@ new_content = re.sub(pattern, '', content, flags=re.DOTALL)
 with open(mh, 'w') as f:
     f.write(new_content)
 PYEOF
-fi
 
-# Append new block to MEMORY_HEALTH.md (off the heartbeat hot path — see header comment)
 cat >> "$MEMORY_HEALTH" << EOF
 
 <!-- memory-health-block -->
-## Memory Health (last run: $(date '+%Y-%m-%d %H:%M %Z'))
-- daily_logs_current: $daily_logs_current ($daily_count/3 days present)
-- working_context_age_hours: $age_hours
-- l1_sync_status: $l1_status (age: ${sync_age_hours:-?}h)
+## Memory Health (last run: $RUN_TS)
+- daily_logs_current: $daily_logs_current ($daily_present_count/7 in last week; max gap: ${daily_max_gap_days}d)
+- working_context_age_hours: $wc_age_hours
+- l1_freshness_hours: $l1_age_hours
 - vault_write_errors: $vault_errors
 - memory_promotions_bytes: $promo_size
 - l1_size_bytes: $l1_size
+- stale_context: $stale_context
 <!-- /memory-health-block -->
 EOF
+
+# Append run-summary to rolling log file
+echo "$RUN_TS | daily=$daily_logs_current(${daily_present_count}/7,maxgap=${daily_max_gap_days}d) | wc_age=${wc_age_hours}h | l1_age=${l1_age_hours}h | vault_err=$vault_errors | stale=$stale_context" >> "$LOG_FILE"
+
 echo "✓ Metrics written to MEMORY_HEALTH.md"
-
-# Also log to file
-echo "$(date '+%Y-%m-%d %H:%M:%S') | daily=$daily_logs_current | wc_age=${age_hours}h | l1=$l1_status | vault_err=$vault_errors" >> "$LOG_FILE"
-
-echo "✓ Memory health check complete"
 exit 0
