@@ -35,7 +35,7 @@ with open('${WORKSPACE:-/path/to/your/workspace}/MEMORY.md', 'r') as f:
 
 # Find all "## Promoted From Short-Term Memory (YYYY-MM-DD)" sections
 # These are at the end of MEMORY.md, separated by blank lines
-pattern = r'(## Promoted From Short-Term Memory \(\d{4}-\d{2}-\d{2}\)\n(?:<!-- openclaw-memory-promotion:.*?-->\n- .*?\n)+)'
+pattern = r'(## Promoted From Short-Term Memory \(\d{4}-\d{2}-\d{2}\)\n\s*\n(?:<!-- openclaw-memory-promotion:.*?-->\n- .*?\n)+)'
 matches = re.findall(pattern, content, re.MULTILINE)
 
 if not matches:
@@ -73,7 +73,7 @@ while IFS= read -r line; do
     if [[ "$line" == SECTION::* ]]; then
         # Parse: SECTION::date::base64content
         date=$(echo "$line" | cut -d: -f3)
-        encoded=$(echo "$line" | cut -d: -f4-)
+        encoded=$(echo "$line" | awk -F'::' '{print $3}')
         content=$(echo "$encoded" | base64 -d 2>/dev/null)
         
         if [[ -z "$content" ]]; then
@@ -125,7 +125,7 @@ with open('${WORKSPACE:-/path/to/your/workspace}/MEMORY.md', 'r') as f:
     content = f.read()
 
 # Remove "## Promoted From Short-Term Memory" sections
-pattern = r'\n## Promoted From Short-Term Memory \(\d{4}-\d{2}-\d{2}\)\n(?:<!-- openclaw-memory-promotion:.*?-->\n- .*?\n)+'
+pattern = r'\n## Promoted From Short-Term Memory \(\d{4}-\d{2}-\d{2}\)\n\s*\n(?:<!-- openclaw-memory-promotion:.*?-->\n- .*?\n)+'
 new_content = re.sub(pattern, '', content)
 
 # Add a pointer if there were any promotions
