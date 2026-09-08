@@ -48,7 +48,7 @@ HEARTBEAT="$WORKSPACE/HEARTBEAT.md"
 LOG_DIR="${LOG_DIR:-$WORKSPACE/logs}"
 LOG_FILE="$LOG_DIR/memory-health.log"
 
-mkdir -p "$LOG_DIR" "$(dirname "$MEMORY_HEALTH")"
+mkdir -p "$LOG_DIR" "$DAILY_DIR" "$(dirname "$MEMORY_HEALTH")"
 
 now_epoch=$(date +%s)
 TODAY=$(date '+%Y-%m-%d')
